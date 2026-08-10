@@ -8,7 +8,7 @@
 
 ## 1. Overview
 
-This document outlines the architecture for a single-node, embedded relational database written in Rust. It diverges from traditional Multi-Version Concurrency Control (MVCC) designs (like PostgreSQL), which overwrite pages in place and rely on a Write-Ahead Logs (WALs). Instead, it utilizes a pure **Copy-on-Write (CoW) B+Tree** backed by a memory-mapped file.
+This document outlines the architecture for a single-node, embedded relational database written in Rust. It diverges from traditional Multi-Version Concurrency Control (MVCC) designs (like PostgreSQL), which overwrite pages in place and rely on a Write-Ahead Log (WAL). Instead, it utilizes a pure **Copy-on-Write (CoW) B+Tree** backed by a memory-mapped file.
 
 This append-only architecture naturally provides zero-cost branching, $O(\log N)$ structural auditing, explicit time-travel queries, and native Optimistic Concurrency Control (OCC) by binding row versions directly to transaction IDs.
 
