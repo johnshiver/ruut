@@ -1,0 +1,7 @@
+[package]
+name = "pager"
+version = "0.1.0"
+edition = "2024"
+description = "Storage layer: page allocation, memory-mapped I/O, and Meta Page management for ruut."
+
+[dependencies]
