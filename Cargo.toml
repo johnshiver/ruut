@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/pager",
+]
+resolver = "2"
+
+[package]
+name = "ruut"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pager = { path = "crates/pager" }
