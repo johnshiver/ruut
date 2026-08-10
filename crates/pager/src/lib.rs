@@ -21,6 +21,9 @@ pub const MAGIC: u32 = 0xCAFE_BABE;
 /// Page identifier.
 pub type PageId = u64;
 
+/// Number of pages to reserve ahead when growing the file.
+const GROWTH_EXTENT_PAGES: u32 = 8;
+
 /// Errors that can occur in Pager operations.
 #[derive(Debug)]
 pub enum PagerError {
@@ -38,6 +41,8 @@ pub enum PagerError {
     PageAlreadyFree(PageId),
     /// Opened file is too small to contain a valid Meta Page
     FileTooSmall(u64),
+    /// The total page count has reached the maximum representable value
+    PageCountOverflow,
 }
 
 impl std::fmt::Display for PagerError {
@@ -54,6 +59,9 @@ impl std::fmt::Display for PagerError {
             PagerError::PageAlreadyFree(id) => write!(f, "Page {} is already free", id),
             PagerError::FileTooSmall(size) => {
                 write!(f, "File is too small to be a valid database: {} bytes", size)
+            }
+            PagerError::PageCountOverflow => {
+                write!(f, "Page count has reached the maximum representable value")
             }
         }
     }
@@ -119,6 +127,9 @@ pub struct Pager {
     mmap: MmapMut,
     meta: MetaPage,
     free_list: Vec<PageId>, // Phase 1 in-memory Free List scaffolding
+    /// Number of pages currently covered by the memory map (may exceed `meta.total_pages`
+    /// because the file is grown in extents to amortise remap overhead).
+    mapped_pages: u32,
 }
 
 impl Pager {
@@ -157,6 +168,7 @@ impl Pager {
                 mmap,
                 meta,
                 free_list: Vec::new(),
+                mapped_pages: 1,
             })
         } else {
             if len < PAGE_SIZE as u64 {
@@ -174,11 +186,13 @@ impl Pager {
                 return Err(PagerError::FileTooSmall(len));
             }
 
+            let mapped_pages = meta.total_pages;
             Ok(Pager {
                 file,
                 mmap,
                 meta,
                 free_list: Vec::new(),
+                mapped_pages,
             })
         }
     }
@@ -188,7 +202,9 @@ impl Pager {
         self.meta
     }
 
-    /// Atomically overwrites the Meta Page on the memory map.
+    /// Overwrites the Meta Page on the memory map.
+    /// Callers must invoke `flush()` and/or `sync()` after this method
+    /// to propagate changes to the OS page cache and to durable storage.
     pub fn update_meta(&mut self, meta: MetaPage) -> Result<(), PagerError> {
         if meta.magic != MAGIC {
             return Err(PagerError::InvalidMagic(meta.magic));
@@ -200,18 +216,30 @@ impl Pager {
 
     /// Allocates a new page ID, reclaiming from the Free List if available,
     /// or extending the file size and memory map sequentially.
+    /// The file is grown in extents of `GROWTH_EXTENT_PAGES` pages to reduce
+    /// remap overhead as the database grows.
     pub fn allocate_page(&mut self) -> Result<PageId, PagerError> {
         if let Some(page_id) = self.free_list.pop() {
             Ok(page_id)
         } else {
             let new_page_id = self.meta.total_pages as PageId;
-            self.meta.total_pages += 1;
+            self.meta.total_pages = self
+                .meta
+                .total_pages
+                .checked_add(1)
+                .ok_or(PagerError::PageCountOverflow)?;
 
-            let new_len = (self.meta.total_pages as u64) * (PAGE_SIZE as u64);
-            self.file.set_len(new_len)?;
-
-            // Recreate the memory map to cover the newly appended region
-            self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
+            // Only extend the file (and remap) when we exceed the already-mapped region.
+            if self.meta.total_pages > self.mapped_pages {
+                let new_mapped = self
+                    .mapped_pages
+                    .checked_add(GROWTH_EXTENT_PAGES)
+                    .ok_or(PagerError::PageCountOverflow)?;
+                let new_len = (new_mapped as u64) * (PAGE_SIZE as u64);
+                self.file.set_len(new_len)?;
+                self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
+                self.mapped_pages = new_mapped;
+            }
 
             // Persist the updated count in Page 0 immediately
             self.write_meta_to_mmap()?;
@@ -240,9 +268,16 @@ impl Pager {
         if page_id >= self.meta.total_pages as PageId {
             return Err(PagerError::InvalidPageId(page_id));
         }
-        let start = (page_id as usize) * PAGE_SIZE;
-        let end = start + PAGE_SIZE;
-        let slice = &self.mmap[start..end];
+        let start = (page_id as usize)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(PagerError::InvalidPageId(page_id))?;
+        let end = start
+            .checked_add(PAGE_SIZE)
+            .ok_or(PagerError::InvalidPageId(page_id))?;
+        let slice = self
+            .mmap
+            .get(start..end)
+            .ok_or(PagerError::InvalidPageId(page_id))?;
         Ok(slice.try_into().unwrap())
     }
 
@@ -255,9 +290,16 @@ impl Pager {
         if page_id >= self.meta.total_pages as PageId {
             return Err(PagerError::InvalidPageId(page_id));
         }
-        let start = (page_id as usize) * PAGE_SIZE;
-        let end = start + PAGE_SIZE;
-        let slice = &mut self.mmap[start..end];
+        let start = (page_id as usize)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(PagerError::InvalidPageId(page_id))?;
+        let end = start
+            .checked_add(PAGE_SIZE)
+            .ok_or(PagerError::InvalidPageId(page_id))?;
+        let slice = self
+            .mmap
+            .get_mut(start..end)
+            .ok_or(PagerError::InvalidPageId(page_id))?;
         Ok(slice.try_into().unwrap())
     }
 
@@ -362,7 +404,8 @@ mod tests {
         let p1 = pager.allocate_page().unwrap();
         assert_eq!(p1, 1);
         assert_eq!(pager.get_meta().total_pages, 2);
-        assert_eq!(db_path.metadata().unwrap().len(), 8192);
+        // File is grown in extents; the on-disk size will be at least 2 pages.
+        assert!(db_path.metadata().unwrap().len() >= 2 * PAGE_SIZE as u64);
 
         // Write some data to p1
         {
