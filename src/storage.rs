@@ -110,10 +110,6 @@ impl StorageEngine {
         &self.dialect
     }
 
-    pub fn db(&self) -> &Database {
-        &self.db
-    }
-
     pub fn begin_write(&self, tx_id: u64) -> Result<WriteTransaction, StorageError> {
         Ok(WriteTransaction {
             inner: self.db.begin_write()?,
@@ -137,10 +133,6 @@ pub struct WriteTransaction {
 }
 
 impl WriteTransaction {
-    pub fn redb(&self) -> &redb::WriteTransaction {
-        &self.inner
-    }
-
     pub fn tx_id(&self) -> u64 {
         self.tx_id
     }
