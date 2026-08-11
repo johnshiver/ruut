@@ -30,18 +30,18 @@ ruut/
 
 The project is broken into five phases that map directly to the design document.
 
-### Phase 1 — Pager & I/O (`crates/pager`) ✅ *scaffolded*
+### Phase 1 — Pager & I/O (`crates/pager`) 🚀 *Completed*
 
 > Storage layer: memory-mapped files, page allocation, and Meta Page management.
 
-- [ ] `memmap2` integration for mmap-backed page access
-- [ ] Fixed 4 KB page allocation and deallocation
-- [ ] Meta Page (Page 0) read/write: magic number, schema version, TxID, root page ID
-- [ ] Free List scaffolding
+- [x] `memmap2` integration for mmap-backed page access
+- [x] Fixed 4 KB page allocation and deallocation
+- [x] Meta Page (Page 0) read/write: magic number, schema version, TxID, root page ID
+- [x] Free List scaffolding
 
 **Key constants:** `PAGE_SIZE = 4096`, `MAGIC = 0xCAFEBABE`
 
-### Phase 2 — CoW B+Tree (`crates/btree`)
+### Phase 2 — CoW B+Tree (`crates/btree`) 🎯 *Next Task*
 
 > Index layer: Copy-on-Write path-copying for Insert, Update, Delete.
 
