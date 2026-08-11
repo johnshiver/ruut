@@ -121,13 +121,13 @@ impl StorageEngine {
         Ok(sqlparser::parser::Parser::parse_sql(&self.dialect, sql)?)
     }
 
-    pub fn create_table(&self, schema: &TableSchema) -> Result<TableLayout, StorageError> {
-        let _ = schema;
-        todo!("provision redb primary/history/index tables")
+    pub fn table_layout(&self, schema: &TableSchema) -> TableLayout {
+        TableLayout::from_schema(schema)
     }
 }
 
 pub struct WriteTransaction {
+    #[allow(dead_code)]
     inner: redb::WriteTransaction,
     tx_id: u64,
 }
