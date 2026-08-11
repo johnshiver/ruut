@@ -10,4 +10,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.100"
 pager = { path = "crates/pager" }
+redb = "4.1.0"
+sqlparser = "0.62.0"
+thiserror = "2.0.16"
+zerocopy = { version = "0.8.27", features = ["derive"] }
