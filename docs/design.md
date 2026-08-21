@@ -1,418 +1,582 @@
-# Design Document: Copy-on-Write (CoW) Relational Database in Rust
+# Technical Design: Copy-on-Write B+ Tree Relational Database in Rust
 
-**Status:** Draft
-**Author:** AI Assistant
+**Status:** Initial Architecture / Coding-LLM Implementation Specification
 **Date:** August 2026
 
 ---
 
-## 1. Overview
+## 1. Executive Summary
 
-This document outlines the architecture for a single-node, embedded relational database written in Rust. It diverges from traditional Multi-Version Concurrency Control (MVCC) designs (like PostgreSQL), which overwrite pages in place and rely on a Write-Ahead Log (WAL). Instead, it utilizes a pure **Copy-on-Write (CoW) B+Tree** backed by a memory-mapped file.
+Build a single-node database engine in Rust whose storage model is a page-oriented copy-on-write (CoW) B+ tree. Every committed database state is represented by an immutable root page and monotonically increasing commit identifier. Transactions read from a stable snapshot and publish a new root using optimistic concurrency control (OCC). Historical retention is a table-level policy, allowing selected tables to expose durable audit history and time-travel queries while ordinary tables may garbage-collect unreachable historical pages.
 
-This append-only architecture naturally provides zero-cost branching, $O(\log N)$ structural auditing, explicit time-travel queries, and native Optimistic Concurrency Control (OCC) by binding row versions directly to transaction IDs.
-
-## 2. Goals & Non-Goals
-
-### Goals
-
-* **ACID Compliance:** Strict guarantees without relying on a WAL.
-* **Memory Safety & Concurrency:** Leverage Rust's borrow checker, `memmap2`, and atomic pointer swaps for thread-safe Snapshot Isolation.
-* **Native Time-Travel & Auditing:** Retain historical tree roots to allow queries against past database states.
-* **First-Class Optimistic Locking (OCC):** Embed versioning into the tuple layer, eliminating application-level `updated_at` schema hacks.
-* **Efficient Single-Node Concurrency:** Support multiple concurrent readers with minimal blocking, and optimistic writes via OCC.
-
-### Non-Goals
-
-* **Distributed Consensus:** This is strictly a single-node, embedded/local engine.
-* **Full SQL Compliance Initially:** The storage engine, transaction manager, and tuple serializer are the priority. A full SQL parser (like `sqlparser-rs`) can be layered on later.
-* **Dynamic Rebalancing:** This document assumes B+Tree nodes are split/merged conservatively; aggressive rebalancing is deferred to Phase 2.
+The implementation must be staged. Do not begin with SQL, mmap, query optimization, or fine-grained OCC. First establish B+ tree correctness and immutable snapshots; then introduce a page abstraction, explicit binary encoding, durable file storage, crash-safe root publication, coarse OCC, relational tables, history retention, and finally SQL. mmap is an optional read-path optimization after the ordinary file-backed implementation is correct and benchmarked.
 
 ---
 
-## 3. Architecture & Components
+## 2. Goals and Non-Goals
 
-The system is composed of four distinct layers, operating from the lowest level of abstraction upward:
+### 2.1 Primary Goals
 
-1. **Pager (Storage Layer):** Manages disk I/O, file extension, page allocation, and memory mapping via the `memmap2` crate.
-2. **B+Tree (Index Layer):** Handles Copy-on-Write path-copying algorithms for `Insert`, `Update`, and `Delete` operations.
-3. **Transaction Manager:** Orchestrates atomic root pointer swaps, validates Optimistic Locking criteria, and manages snapshot isolation.
-4. **Relational Tuple Serializer:** Maps relational rows and implicit system metadata (`_sys_version`, `_sys_txid`) into flat byte arrays for B+Tree storage.
+- Single-node embedded database written in Rust.
+- B+ tree as the fundamental ordered storage structure.
+- Copy-on-write page updates: committed pages are immutable.
+- Stable snapshots identified by `CommitId`/root `PageId`.
+- Optimistic concurrency control as the default transaction model.
+- Table-level history retention (e.g. `HISTORY = RETAIN_ALL`).
+- Time-travel reads of historical committed table state.
+- Crash consistency: after restart, expose either the previous complete commit or the new complete commit, never a partially published tree.
+- Explicit, versioned on-disk format independent of Rust struct layout.
+- Property testing, fuzzing, and fault injection as first-class correctness mechanisms.
+- A path to a useful subset of relational SQL without requiring PostgreSQL feature completeness.
 
-### 3.1 The Pager and Memory Mapping
+### 2.2 Initial Non-Goals
 
-The database exists as a single file on disk. The Pager maps this entire file into memory using `memmap2`.
-
-* **Reads:** Handled entirely via pointer arithmetic against the memory map. The OS virtual memory manager handles page caching, prefetching, and swapping.
-* **Writes:** Changes are never written in-place. Instead, new pages are appended to the end of the file. The Pager allocates Page IDs sequentially or reuses freed pages from the Free List (§7).
-* **Thread Safety:** Read transactions hold an immutable snapshot (via `arc-swap`) to a specific root Page ID. Writes proceed in isolation and atomically swap the root pointer upon commit.
-
-### 3.2 The Copy-on-Write B+Tree
-
-Modifications never overwrite existing nodes. This is the core invariant enabling lock-free readers.
-
-**Modification Flow:**
-
-1. A write transaction begins with the current Root Page ID.
-2. When a leaf node is modified (e.g., a row is inserted), a completely new 4 KB leaf page is allocated.
-3. A new parent branch node is allocated to point to the new leaf (and unchanged siblings).
-4. This cascades upward through the tree. At each level, a new node is created to reflect the modified path.
-5. A new Root Page ID is generated for the tree.
-6. **Atomic Swap:** The Meta Page's `RootPageID` field is updated atomically (via an `fsync()`). Readers with snapshots pointing to old roots remain unaffected and see the old tree state; new readers pick up the new root.
-
-**Snapshot Isolation Guarantee:**
-
-Readers accessing the old root are entirely unaffected by writers. Multiple concurrent readers can operate on different versions of the tree without locks or latches. Writers block only during the short Meta Page commit window.
+- Distributed consensus, replication, or multi-node operation.
+- Full PostgreSQL compatibility.
+- Serializable Snapshot Isolation in the first transaction implementation.
+- Fine-grained concurrent writers in the first OCC implementation.
+- Online compaction/vacuum in the first durable milestone.
+- mmap as a correctness dependency.
+- A sophisticated cost-based query optimizer.
+- Foreign keys, triggers, stored procedures, or advanced SQL initially.
 
 ---
 
-## 4. Disk & Page Layout
+## 3. Core Invariants
 
-Pages are fixed at **4096 bytes (4 KB)** to align with the OS virtual memory page size. This alignment eliminates translation overhead and naturally maps to modern hardware.
+These invariants are architectural requirements. Violations are correctness bugs, not implementation choices.
 
-### 4.1 Meta Page (Page 0)
+- Committed pages are immutable.
+- A committed root identifies a complete, internally consistent database snapshot.
+- A transaction never mutates pages reachable from its base committed root.
+- A failed or aborted transaction cannot make its private pages reachable from the committed root.
+- Root publication occurs only after every page reachable exclusively through the new root has been durably written.
+- On restart, the engine chooses the newest valid committed superblock/root and ignores incomplete newer state.
+- Page references persisted on disk are stable `PageId`s, never process pointers or Rust references.
+- Dirty transaction-local page identifiers cannot be confused with committed `PageId`s.
+- Historical snapshots retained by policy remain reachable and cannot be reclaimed.
+- Every decode operation validates enough metadata/bounds to reject malformed or corrupt pages safely.
+- The logical result of B+ tree operations must match a trusted reference model such as `std::collections::BTreeMap`.
 
-The Meta Page is the durability and consistency anchor. Committing a transaction is fundamentally an atomic write to this page.
+---
 
-**Layout:**
+## 4. High-Level Architecture
 
 ```
-Offset  Size  Field
-------  ----  -----
-0       4     Magic Number (e.g., 0xCAFEBABE)
-4       4     Schema Version (incremented on schema changes)
-8       8     Current Master Transaction ID (TxID)
-16      8     Root Page ID (pointer to active B+Tree root)
-24      8     Free List Root Page ID (pointer to GC tree)
-32      4     Total pages allocated (for Free List statistics)
-36      ...   Reserved for future metadata
+SQL Parser / Binder / Planner / Executor       [late phase]
+                   |
+            Relational Catalog
+         Tables / Indexes / Schemas
+                   |
+            Transaction Manager
+         Snapshots + OCC + Commits
+                   |
+             CoW B+ Tree
+      get / put / delete / range scan
+                   |
+               PageStore
+         /           |           \
+MemoryPageStore  FilePageStore  MmapReadStore
+     tests          baseline       optional
+                   |
+           database file(s)
 ```
 
-**Invariants:**
+### 4.1 Layering Rule
 
-- The Meta Page is the **only page ever overwritten** in-place.
-- All other pages are append-only.
-- A transaction commit atomically writes the Meta Page + calls `fsync()`. If the system crashes after the first `fsync()` but before the Meta Page sync, the new pages are orphaned and reclaimed by GC.
+Higher layers may depend on lower layers; lower layers must not know about SQL or relational semantics. The B+ tree operates on encoded byte keys/values and page references. `PageStore` does not know about B+ tree nodes. This separation permits the same tree implementation to run against an in-memory page store and a file-backed store.
 
-### 4.2 Node Pages (Branch & Leaf)
+---
 
-Nodes pack headers and serialized KV pairs efficiently into 4 KB blocks.
+## 5. Fundamental Types
 
-**Layout:**
+```rust
+pub type CommitId = u64;
 
-```
-Offset  Size  Field
-------  ----  -----
-0       2     Flags (0x0001 = Leaf, 0x0002 = Branch, 0x0004 = Free List Node)
-2       2     Item Count (number of keys in this node)
-4       2     Free Space Offset (pointer to the start of unused bytes, growing downward)
-6       2     Minimum Key Size (optimization hint for binary search)
-8       N*2   Cell Pointers (array of offsets, one per key; enables binary search without shifting)
-8+N*2   ...   Payload (Keys/Values, growing backward from end of page)
-```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PageId(pub u64);
 
-**Cell Pointer Strategy:**
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DirtyPageId(pub u32);
 
-Instead of storing keys and values at the head of the payload region and shifting data on insertion, the design uses an indirection layer:
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PageRef {
+    Committed(PageId),
+    Dirty(DirtyPageId),
+}
 
-- Each key/value pair is stored at an arbitrary offset in the Payload region.
-- A **Cell Pointer** (2 bytes) at the head of the page records the exact byte offset of that key/value.
-- On insertion, a new Cell Pointer is added, and the payload grows into free space—no shifting of existing data.
-- Binary search iterates the sorted Cell Pointers to locate keys without touching the payload until comparison.
-
-**Example (Leaf Node):**
-
-```
-| Flags=0x0001 | Count=3 | FreeOff=3000 | Padding | [200, 150, 450] | ... unused ... | value3 | value2 | value1 |
-                                                    ↑ Cell Pointers              ↑ Payload (grows backward)
+#[derive(Clone, Copy, Debug)]
+pub struct Snapshot {
+    pub commit_id: CommitId,
+    pub root: PageId,
+}
 ```
 
-This design minimizes memory copying on insertion and is typical of high-performance embedded databases (e.g., SQLite, LMDB).
+`PageId` and `DirtyPageId` are kept distinct as deliberate type-level protection against accidentally serializing an uncommitted reference into durable state.
 
 ---
 
-## 5. Transaction & Concurrency Flow
+## 6. B+ Tree Design
 
-### 5.1 Read-Only Transactions
+### 6.1 Initial Logical Tree
 
-Readers are **lock-free** and see a consistent snapshot of the tree.
+The first milestone may use convenient Rust-owned nodes (`Box`/`Arc`) solely to prove algorithms. Required operations: `get`, `insert`/`upsert`, `delete`, ordered range scan, leaf split, internal split, root split, and snapshot preservation. Deletion rebalancing may be deferred if tombstones or underfull pages are explicitly accepted for the first milestone.
 
-**Read Transaction Flow:**
+### 6.2 Page-Oriented Tree
 
-1. A read transaction begins by reading the Meta Page and snapping the current `RootPageID`.
-2. It acquires a reference to this root via `arc-swap::ArcSwap<Arc<TreeNode>>`. This reference is immutable.
-3. The transaction uses this root to navigate the B+Tree, fetching pages via memory mapping.
-4. Multiple concurrent readers can hold different roots simultaneously (e.g., one reading an old version, one reading the newest). The Pager ensures their pages remain in the Free List's non-reclamable set as long as readers exist.
-5. When the read transaction ends, the reference is dropped.
+After logical correctness, replace pointer-to-node relationships with `PageRef`/`PageId` relationships and encode nodes into fixed-size pages. This is the decisive transition toward a storage engine.
 
-**Advantages:**
+### 6.3 Page Size
 
-- No latches or locks required during reads.
-- Readers do not interfere with writers (or other readers).
-- A reader can inspect historical database states if a root ID is provided.
+Make page size a format/configuration parameter during development. Benchmark 4 KiB, 8 KiB, and 16 KiB later. Do not scatter a magic page size throughout algorithms. A default of 8 KiB or 16 KiB is reasonable for development.
 
-### 5.2 Write Transactions & Atomic Commits
+### 6.4 Slotted Page Format
 
-Writes acquire an exclusive lock on the tree to ensure only one writer at a time.
-
-**Write Transaction Flow:**
-
-1. The writer acquires an exclusive lock (e.g., a `Mutex<>` or hand-rolled seqlock). It reads the current Master Root Page ID from the Meta Page.
-2. It performs `INSERT`, `UPDATE`, or `DELETE` operations, using the CoW algorithm to generate new pages. All new pages are buffered in memory (or a temporary staging area).
-3. **Commit Phase 1 — Durability:**
-   - Flush all buffered pages to the end of the file using standard sequential I/O (appends).
-   - Call `fsync()` to ensure the kernel has written all bytes to disk. The kernel may still be ordered to crash at this point.
-   - Store the new Root Page ID and TxID in memory.
-4. **Commit Phase 2 — Consistency:**
-   - Atomically overwrite the Meta Page with the new `TxID`, `RootPageID`, and other metadata.
-   - Call `fsync()` again.
-   - **Post-commit:** If the system crashes before this second `fsync()`, readers will still see the old root (and the new pages are orphaned; the Free List will reclaim them in a later GC pass).
-5. Atomically swap the root pointer via `arc-swap`. New readers now pick up the new root.
-6. Release the writer lock.
-
-**Crash Recovery:**
-
-Upon restart, the Pager reads the Meta Page. If the Meta Page is consistent (magic number + schema version match), that root is the authoritative version. Any pages beyond the end of the active tree are considered free and marked for reclamation.
-
-### 5.3 Optimistic Concurrency Control (OCC)
-
-The Transaction Manager enforces **OCC at two levels**: stateful and stateless.
-
-#### Stateful OCC (Long-Lived Transactions)
-
-For long-running transactions (e.g., in an application server), the Transaction Manager tracks:
-
-- **ReadSet:** A hash map of `{RowID → TxID}` recorded at the time the row was read.
-- **WriteSet:** A hash map of `{RowID → NewValue}` of rows the transaction intends to write.
-
-**Validation at Commit:**
-
-1. Acquire the writer lock.
-2. Re-scan the active tree for all rows in the ReadSet.
-3. For each row, verify its current `TxID` (stored in the tuple header) matches the recorded TxID at read-time.
-4. If any mismatch is found, **abort the transaction** with a conflict error (the application retries).
-5. If all rows in the ReadSet are still valid, proceed with commit (Phases 1 & 2 above).
-
-This ensures that if another transaction modified any row the current transaction read, the validation fails, and the application is notified.
-
-#### Stateless OCC (HTTP/REST Clients)
-
-Clients query the `_sys_version` field and return it in `UPDATE` payloads. The execution engine supports:
-
-```sql
-UPDATE users SET status = 'active' WHERE id = 10 EXPECTING VERSION 405;
-```
-
-The Tuple Serializer verifies that the current tuple's `TxID` equals 405 before allowing the modification. If the version doesn't match, the engine returns a `ConflictError`, and the client can refetch and retry.
-
----
-
-## 6. Garbage Collection & The Free List
-
-Since data is append-only, the database file grows monotonically. Without GC, the file would eventually exhaust disk space. The Free List manages page reuse.
-
-### 6.1 Free List Structure
-
-The database maintains a dedicated internal B+Tree called the **Free List**. This tree maps freed `PageID` → `PageFreedTxID` (the transaction ID that made the page safe to reuse).
-
-**Why a separate tree?** Queries are fast (`O(log N)` lookups), and it integrates cleanly with the existing B+Tree infrastructure.
-
-### 6.2 Page Reuse Workflow
-
-**When a page is freed:**
-
-1. A writer replaces an old page with a new copy (the CoW path). The old `PageID` is inserted into the Free List with the current `TxID`.
-
-**When pages can be reused:**
-
-2. A background **Reclamation Thread** monitors the set of active read transactions (held in a thread-safe data structure, e.g., a concurrent hash map or an epoch-based tracker).
-3. If the oldest active read transaction has a `TxID` older than some freed page's `PageFreedTxID`, that page is **still not safe** (a reader might still be using it).
-4. Only when all active transactions are younger than `PageFreedTxID` is the page marked as reusable.
-5. The Pager's allocator consults the Free List before extending the file.
-
-### 6.3 Implementation Notes
-
-- **Epoch-Based Reclamation (Advanced):** If seeking very fine-grained reclamation, the system can use epoch-based GC (similar to the `seize` crate): readers "check in" to the current epoch, and the reclamation thread advances the epoch periodically. This avoids querying active readers for every GC pass.
-- **Batch Reuse:** Pages are reused lazily, not immediately. The Pager may batch small allocations or defer reuse to off-peak hours to minimize fragmentation.
-
----
-
-## 7. Schema Versioning & Forward Compatibility
-
-To support schema evolution without full rewrites:
-
-- The Meta Page includes a `SchemaVersion` field (§4.1).
-- Each Tuple includes a `SchemaVersion` in its header (§8.1).
-- When a schema change is made (e.g., adding a column), the `SchemaVersion` is incremented.
-- The Relational Layer includes a schema registry that defines the encoding for each schema version.
-- Tuples with older schema versions are decoded according to their recorded version; missing columns are populated with defaults on-the-fly.
-
-This approach allows readers to coexist with tuples of different schema versions and enables gradual migration.
-
----
-
-## 8. Relational Tuple Serialization
-
-The Relational Tuple Serializer maps rows into flat byte arrays for the B+Tree.
-
-### 8.1 Tuple Layout
-
-Every tuple, regardless of content, is prefixed with a fixed-size header:
+**Leaf page (conceptual)**
 
 ```
-| TxID (8 bytes) | SchemaVersion (4 bytes) | Reserved (4 bytes) | Column1 | Column2 | ... |
++------------------------------+
+| Page header                  |
+| magic / format version       |
+| page type                    |
+| entry count                  |
+| page id                      |
+| creation commit (optional)   |
+| next leaf PageId             |
+| free_start / free_end        |
+| checksum                     |
++------------------------------+
+| slot directory               |
+| (offset, length) ...         |
++------------------------------+
+| free space                   |
++------------------------------+
+| variable-length records      |
++------------------------------+
 ```
 
-- **TxID:** The transaction ID of the last writer. Serves as the implicit `_sys_version` for OCC.
-- **SchemaVersion:** Identifies the schema version of the column data that follows.
-- **Reserved:** For future metadata (e.g., tombstone flag, compression codec).
-- **Columns:** Variable-length encoding of the row's columns (see §8.2).
-
-### 8.2 Column Encoding
-
-Columns are encoded using a compact format:
-
-- **Fixed-size types** (int, bool): Stored as-is.
-- **Variable-length types** (strings, blobs): Prefixed with a 2-byte length, followed by raw bytes.
-- **NULL:** Encoded as a special 2-byte marker (e.g., `0xFFFF`).
-
-This enables efficient scanning and slicing without full deserialization.
-
-### 8.3 Indexing & Primary Key
-
-- The **Primary Key** is stored as the B+Tree key (encoded and sortable).
-- Non-primary-key columns are stored as the B+Tree value (the full tuple).
-- Secondary indexes are separate B+Trees, each mapping (indexed_column_value → primary_key). Queries on secondary indexes perform an index scan + lookup in the primary index.
+Use explicit little-endian encode/decode routines. Do not persist Rust structs directly and do not make `serde`/`bincode` the canonical database format. The disk format must be deliberately versioned and independently testable.
 
 ---
 
-## 9. Consistency & Durability Guarantees
+## 7. PageStore
 
-### 9.1 ACID Properties
+```rust
+pub trait PageStore {
+    fn read_page(&self, id: PageId) -> Result<Box<[u8]>>;
+    fn write_page(&mut self, id: DirtyPageId, data: Box<[u8]>) -> Result<()>;
+    fn allocate(&mut self) -> DirtyPageId;
+    fn commit(&mut self, root: DirtyPageId) -> Result<Snapshot>;
+}
+```
 
-| Property | Guarantee | Implementation |
-|----------|-----------|-----------------|
-| **Atomicity** | Writes are all-or-nothing. | Meta Page commit is atomic; if a crash occurs before Meta Page is synced, the transaction is entirely rolled back (new pages are orphaned). |
-| **Consistency** | All ACID properties are maintained. | Schema versioning, constraint checking in the execution layer. |
-| **Isolation** | Snapshot Isolation (readers see a consistent point-in-time). | CoW B+Tree ensures readers and writers never conflict; each reader uses an immutable tree root. OCC ensures stateful writers validate the ReadSet at commit. |
-| **Durability** | Writes are persistent after commit returns. | Two-phase commit with fsync; data is on disk before `COMMIT` returns to the application. |
+### 7.1 MemoryPageStore
 
-### 9.2 Crash Recovery
+Used in tests and Phase 1/2. Stores pages in a `HashMap`. Supports full snapshot semantics without disk I/O.
 
-1. On startup, read the Meta Page.
-2. Validate the magic number and schema version.
-3. Use the `RootPageID` as the active tree root.
-4. Pages beyond the end of the active tree are considered orphaned and marked for GC.
-5. Any in-flight transaction (whose pages were written but Meta Page not synced) are discarded.
+### 7.2 FilePageStore
 
----
+Baseline durable implementation. Uses positioned I/O (`pread`/`pwrite`). Append-only page allocation. Atomic root publication via dual superblocks.
 
-## 10. Development Milestones
+### 7.3 MmapReadStore (optional, Phase 10)
 
-### Phase 1: Pager & I/O (Weeks 1-2)
-
-**Deliverables:**
-- `memmap2` integration.
-- Page allocation and deallocation.
-- Meta Page read/write.
-- Free List scaffolding.
-
-**Validation:** Unit tests for basic page I/O, allocation, and Meta Page serialization.
-
-### Phase 2: CoW B+Tree (Weeks 3-4)
-
-**Deliverables:**
-- B+Tree node structures (branch, leaf).
-- Insert, update, delete with CoW path-copying.
-- Tree splitting and merging.
-- Binary search on nodes.
-
-**Validation:** Property-based tests (e.g., QuickCheck) verifying tree invariants (all keys sorted, all leaves at same depth, etc.).
-
-### Phase 3: Transaction Manager (Weeks 5-6)
-
-**Deliverables:**
-- Read transaction snapshots (`arc-swap`).
-- Write transaction lock & OCC validation.
-- Atomic root pointer swaps.
-- Basic reclamation thread.
-
-**Validation:** Concurrent read/write tests; OCC conflict detection tests.
-
-### Phase 4: Relational Serialization (Weeks 7-8)
-
-**Deliverables:**
-- Tuple encoder/decoder.
-- Schema versioning logic.
-- Primary key extraction.
-- `_sys_version` field.
-
-**Validation:** Round-trip serialization tests; schema evolution tests.
-
-### Phase 5: SQL/API Layer & Time-Travel Queries (Weeks 9-10)
-
-**Deliverables:**
-- SQL parser (e.g., `sqlparser-rs`).
-- Query executor.
-- Time-travel query support (e.g., `SELECT ... AS OF TIMESTAMP` or `SELECT ... FOR VERSION`).
-- HTTP API (if embedded in a service).
-
-**Validation:** End-to-end integration tests; performance benchmarks.
+Read-only `mmap` overlay over `FilePageStore`. Introduced only after `FilePageStore` is benchmarked and proven correct.
 
 ---
 
-## 11. Performance Considerations
+## 8. Storage Format
 
-### 11.1 Read Performance
+### 8.1 Superblock
 
-- Memory-mapped I/O is fast; the OS page cache minimizes disk access.
-- Binary search on sorted Cell Pointers is efficient.
-- No latches or locks; concurrent readers scale linearly with core count.
+The database maintains two superblock slots (A and B). Each superblock contains:
 
-### 11.2 Write Performance
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 8 | Magic (`0x52555554_42545245` — "RUUTBTRE") |
+| 8 | 4 | Format version |
+| 12 | 4 | Superblock slot (0 or 1) |
+| 16 | 8 | Generation counter (monotonically increasing) |
+| 24 | 8 | `CommitId` |
+| 32 | 8 | Root `PageId` |
+| 40 | 8 | Total pages allocated |
+| 48 | 8 | Commit log tail `PageId` |
+| 56 | 8 | Checksum (CRC32 or xxHash over bytes 0–55) |
 
-- CoW causes memory overhead (new nodes on every write path), but batching writes reduces this.
-- Append-only I/O is fast and sequential.
-- OCC validation is fast for transactions with small ReadSets.
+On restart, read both superblocks, validate checksums, and choose the one with the higher generation counter. The other slot (or one with invalid checksum) is ignored.
 
-### 11.3 GC Overhead
+### 8.2 Page Header
 
-- Epoch-based reclamation can amortize the cost.
-- Fragmentation: Reusing freed pages from the Free List minimizes file growth.
+Every page begins with a fixed-size header:
 
-### 11.4 Future Optimizations
-
-- **Compression:** Pages can be compressed if write amplification is a bottleneck.
-- **SIMD Scans:** Vectorize column scans for analytical workloads.
-- **Multi-version Leaf Nodes:** Store multiple versions of a row in the same leaf to reduce tree height.
-
----
-
-## 12. Limitations & Future Work
-
-### Known Limitations
-
-1. **Single-node only:** No replication or distribution.
-2. **Write serialization:** Only one writer at a time (can be addressed with timestamp ordering in Phase 3+).
-3. **No query optimization:** The SQL layer will initially be simple; cost-based optimization is deferred.
-
-### Future Extensions
-
-1. **Multi-table transactions:** Current design assumes single-table operations; cross-table transactions require careful deadlock prevention.
-2. **Distributed MVCC:** Export time-travel snapshots to replicas.
-3. **Incremental backup:** Leverage the append-only structure for efficient snapshots.
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | Page magic |
+| 4 | 2 | Format version |
+| 6 | 2 | Page type (leaf / internal / overflow / free) |
+| 8 | 8 | `PageId` (self-identifying) |
+| 16 | 8 | Creation `CommitId` |
+| 24 | 4 | Entry count |
+| 28 | 4 | Checksum |
 
 ---
 
-## Appendix A: References
+## 9. Transaction Manager
 
-- **LMDB** (Howard et al., 2015): Symas' embedded key-value store using CoW B+Trees.
-- **SQLite:** Single-threaded, embedded SQL engine with B+Tree indexes.
-- **PostgreSQL MVCC:** Multi-version concurrency control via tuple headers and visibility functions.
-- **RocksDB:** LSM-tree-based key-value store (contrast: this design favors read performance over write throughput).
+### 9.1 Snapshots
+
+A `Snapshot` pairs a `CommitId` with the root `PageId` at that commit. Read transactions hold a `Snapshot` and may not observe later writes. Snapshots are lightweight — they are plain value types, not reference-counted objects.
+
+### 9.2 Write Transactions
+
+A write transaction begins from a base `Snapshot`, accumulates dirty pages in a private `DirtyPageId`-indexed buffer, and publishes a new root atomically at commit. The `DirtyPageId` namespace is transaction-local and cannot be confused with committed `PageId`s.
+
+### 9.3 Coarse OCC
+
+The first OCC implementation uses a single generation counter. A commit is rejected if the current generation differs from the transaction's base generation. Applications catch the `Conflict` error and retry. Finer-grained OCC (read-set tracking) is deferred until benchmarks justify it.
+
+### 9.4 Commit Protocol
+
+1. Finalize all dirty pages: encode, checksum, write to `FilePageStore`.
+2. `fsync` data pages.
+3. Write the new superblock to the alternate slot with an incremented generation counter.
+4. `fsync` superblock.
+5. Increment in-memory generation; make the new `Snapshot` visible.
+
+A crash at any point before step 4 leaves the previous superblock intact. A crash between steps 4 and 5 is safe: the new superblock is valid on the next open.
 
 ---
 
-**Confidence Score:** 9/10
+## 10. Durable Commit History
 
-**Blurb:** This document outlines a highly robust, standard approach to building a memory-mapped CoW database in Rust. It aligns closely with real-world architectural patterns found in embedded systems like LMDB and modern Rust implementations, leveraging specific ecosystem strengths (memmap2, arc-swap, atomic pointer swaps) to achieve safety, concurrency, and performance simultaneously. The design prioritizes clarity and correctness over aggressive optimization; future phases can introduce advanced tuning.
+```rust
+pub struct CommitRecord {
+    pub commit_id: CommitId,
+    pub root: PageId,
+    pub timestamp: Timestamp,
+    // later: transaction/user metadata
+}
+```
+
+This provides an ordered database timeline and supports `snapshot(commit_id)` and `snapshot_at(timestamp)`. Initially the commit history is linear.
+
+**Important:** Snapshot capability and retention policy are separate. MVCC only requires old versions while readers may need them. Audit history intentionally pins historical state beyond normal MVCC lifetime.
+
+---
+
+## 11. Relational Layer
+
+### 11.1 Catalog
+
+Once the storage/transaction layer is durable, add a catalog containing table IDs, names, schema versions, column definitions, primary indexes, secondary indexes, and history policy. Catalog changes are themselves transactional.
+
+### 11.2 Tables
+
+Represent each table primarily as a B+ tree keyed by encoded primary key. Secondary indexes are additional B+ trees whose updates occur in the same transaction.
+
+```rust
+struct TableDescriptor {
+    table_id: TableId,
+    name: String,
+    schema: Schema,
+    primary_root: PageId,
+    secondary_indexes: Vec<IndexDescriptor>,
+    history_policy: HistoryPolicy,
+}
+```
+
+### 11.3 History Policy
+
+```rust
+pub enum HistoryPolicy {
+    None,
+    RetainAll,
+    // later:
+    RetainFor(Duration),
+}
+```
+
+For the first history implementation, exploit retained snapshots rather than duplicating every row version into a separate temporal table. Add specialized per-entity historical indexes only if benchmarks show that queries such as "all versions of entity X" are too expensive when resolved through commit snapshots.
+
+---
+
+## 12. SQL Scope
+
+SQL comes after durable tables. Start with a deliberately small grammar and grow it.
+
+- `CREATE TABLE` with `PRIMARY KEY` and optional history policy.
+- `INSERT`.
+- `SELECT` by primary key.
+- `UPDATE` by primary key.
+- `DELETE` by primary key.
+- Simple `WHERE` predicates.
+- Ordered range scans.
+- Basic secondary indexes.
+- `AS OF VERSION` / `AS OF SYSTEM TIME`.
+- Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`.
+
+Defer joins, aggregates, complex expressions, optimizer statistics, and PostgreSQL compatibility until the storage and transaction semantics are proven.
+
+---
+
+## 13. Garbage Collection / Vacuum
+
+Append-only CoW storage eventually accumulates unreachable pages. GC is required for a long-running production engine but should not block the first durable prototype.
+
+A future collector computes reachability from all roots that must remain live: current root, active transaction snapshots, retained historical commits, and any administrative pins. Unreachable pages may then be reclaimed or compacted into a new file. `RetainAll` tables constrain reclamation because pages needed to reconstruct their historical state remain live.
+
+Do not implement page reuse before crash recovery is solid; append-only allocation makes early correctness reasoning substantially easier.
+
+---
+
+## 14. Testing Strategy
+
+### 14.1 Model-Based Property Tests
+
+Generate random sequences of insert/update/delete/get/range operations and compare logical results with `std::collections::BTreeMap`. Retain random snapshots and verify that later mutations never change earlier snapshot results.
+
+### 14.2 Structural Validation
+
+Implement a debug validator that recursively checks B+ tree invariants: key ordering, separator correctness, legal occupancy, child count, leaf ordering, next-leaf links, reachable `PageId`s, absence of cycles, and root consistency.
+
+### 14.3 Persistence Tests
+
+- Create → write → close → reopen → read.
+- Multiple commits → reopen → read current state.
+- Multiple commits → reopen → read retained historical snapshots.
+- Large split-heavy workloads.
+- Delete-heavy workloads.
+- Corrupt checksum/header detection.
+- Truncated-file handling.
+
+### 14.4 Crash Tests
+
+Run transactions in a child process, kill the process at randomized commit failpoints, reopen, validate the tree, and compare the visible state against the set of legally committed outcomes.
+
+### 14.5 Fuzzing
+
+Fuzz page decoders independently; arbitrary bytes must produce either a validated node or a controlled error, never panic/UB. Fuzz operation sequences and reopen cycles as separate targets.
+
+---
+
+## 15. Observability and Diagnostics
+
+- Expose current `CommitId`/root `PageId`.
+- Tree validator command/API.
+- Page dump/decoder tool.
+- Commit-log inspection tool.
+- Tree statistics: height, page count, fill factor, key count.
+- Transaction conflict counters.
+- Bytes/pages written per commit.
+- Optional tracing spans around reads, splits, commits, syncs, and recovery.
+
+---
+
+## 16. Module Layout
+
+```
+src/
+ lib.rs
+ error.rs
+
+ page/
+   mod.rs
+   id.rs
+   buf.rs
+   codec.rs
+   store.rs
+   memory.rs
+   file.rs
+   checksum.rs
+
+ btree/
+   mod.rs
+   node.rs
+   leaf.rs
+   internal.rs
+   cursor.rs
+   split.rs
+   delete.rs
+   validate.rs
+
+ txn/
+   mod.rs
+   snapshot.rs
+   transaction.rs
+   dirty.rs
+   commit.rs
+   occ.rs
+
+ storage/
+   mod.rs
+   superblock.rs
+   recovery.rs
+   commit_log.rs
+   allocator.rs
+
+ catalog/
+   mod.rs
+   schema.rs
+   table.rs
+   index.rs
+   history.rs
+
+ sql/                 # late phase
+   parser.rs
+   binder.rs
+   plan.rs
+   executor.rs
+
+tests/
+ btree_model.rs
+ snapshots.rs
+ page_codec.rs
+ persistence.rs
+ recovery.rs
+ occ.rs
+ history.rs
+ crash.rs
+
+fuzz/
+ fuzz_targets/
+   page_decode.rs
+   operation_sequence.rs
+```
+
+---
+
+## 17. Implementation Roadmap
+
+### Phase 0 — Repository Baseline ✅
+
+- Document invariants and current architecture.
+- Add `cargo fmt`, `clippy`, unit tests, property-test framework, and CI.
+- Keep dependencies minimal and justify storage-format dependencies.
+
+**Exit criterion:** Clean CI and an architecture/invariants document checked into the repo.
+
+### Phase 1 — Logical In-Memory CoW B+ Tree
+
+- Implement `get`, `put`/`upsert`, `delete`, range scan.
+- Implement splits/root growth.
+- Ensure a mutation creates a new root and does not alter old snapshots.
+- Add model-based property tests against `BTreeMap`.
+- Add structural validator.
+
+**Exit criterion:** Randomized operation sequences and retained snapshots pass reliably.
+
+### Phase 2 — Fixed-Size Page Model
+
+- Introduce `PageId`, `DirtyPageId`, `PageRef`, `PageBuf`.
+- Design page headers and explicit binary codec.
+- Implement `MemoryPageStore`.
+- Convert B+ tree internals from Rust object references to page references.
+- Fuzz page decoding.
+
+**Exit criterion:** The same logical/property tests pass against encoded in-memory pages.
+
+### Phase 3 — File Persistence
+
+- Implement `FilePageStore` with positioned IO.
+- Append-only page allocation.
+- Create/open database format.
+- Persist and validate metadata.
+- Add close/reopen integration tests.
+
+**Exit criterion:** Data survives process restart and the tree validator passes after reopen.
+
+### Phase 4 — Atomic Commits and Recovery
+
+- Implement dual superblocks with generation counters and checksums.
+- Implement dirty-page finalization and root publication.
+- Implement recovery choosing the newest valid superblock.
+- Add failpoints and crash/reopen tests.
+
+**Exit criterion:** Arbitrary simulated crashes during commit yield either the previous or new valid commit, never torn logical state.
+
+### Phase 5 — Transactions and Coarse OCC
+
+- Add `Snapshot` and `Transaction` APIs.
+- Transactions read from immutable base roots.
+- Private dirty pages remain invisible before commit.
+- Reject commit when current generation differs from base generation.
+- Add retryable `Conflict` error and concurrency tests.
+
+**Exit criterion:** Concurrent writers have deterministic, tested conflict behavior; readers remain snapshot-consistent.
+
+### Phase 6 — Durable Commit History
+
+- Add `CommitRecord` and durable commit-log storage.
+- Support `snapshot(commit_id)`.
+- Support `snapshot_at(timestamp)` if timestamps are reliable.
+- Define retention/pinning semantics.
+
+**Exit criterion:** Historical committed roots survive restart and can be opened as read-only snapshots.
+
+### Phase 7 — Relational Catalog and Tables
+
+- Define stable row/key encoding.
+- Add transactional catalog.
+- Implement table primary indexes.
+- Implement schema metadata and basic scalar types.
+- Add secondary indexes after primary-table semantics are stable.
+
+**Exit criterion:** Typed/internal relational API supports transactional CRUD and index maintenance.
+
+### Phase 8 — Audited Tables
+
+- Add `HistoryPolicy` to table metadata.
+- Pin/reclaim historical state according to policy.
+- Implement AS-OF table reads through historical snapshots.
+- Add entity-history API; initially permit snapshot traversal if necessary.
+- Benchmark and decide whether per-entity version indexes are warranted.
+
+**Exit criterion:** A history-enabled table can return old entity/table states after later updates and process restart.
+
+### Phase 9 — Minimal SQL
+
+- Choose or implement parser strategy.
+- Implement `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`.
+- Add transaction statements.
+- Add `AS OF VERSION` / `SYSTEM TIME` syntax.
+- Keep planner simple and deterministic.
+
+**Exit criterion:** End-to-end SQL demonstrates the core differentiators: relational CRUD, OCC conflicts, and native historical queries.
+
+### Phase 10 — GC, Performance, and mmap
+
+- Implement reachability accounting/pinning.
+- Implement offline or stop-the-world compaction first.
+- Benchmark page sizes and cache behavior.
+- Profile syscall/copy overhead of `FilePageStore`.
+- Only then prototype read-only mmap or segmented mmap.
+- Benchmark mmap against positioned IO plus an explicit page cache.
+- Add finer-grained OCC only after contention benchmarks justify it.
+
+**Exit criterion:** Optimizations are supported by benchmarks and preserve all crash/property tests.
+
+---
+
+## 18. Coding-LLM Operating Instructions
+
+Use the following constraints when asking an LLM to modify the repository.
+
+- Work one roadmap phase or narrowly scoped issue at a time.
+- Before editing, inspect the existing repository and summarize relevant modules/invariants.
+- Do not replace working architecture wholesale unless explicitly requested.
+- For each change, state which invariants are affected.
+- Prefer small reviewable commits/diffs.
+- Add or update tests in the same change as implementation.
+- Never claim persistence/crash safety without a test demonstrating the relevant failure boundary.
+- Do not introduce mmap, unsafe code, SQL, GC, or fine-grained OCC ahead of the roadmap merely because it appears more advanced.
+- Avoid `serde`/`bincode` as the canonical page format; use explicit codecs.
+- Treat `clippy` warnings, panics on corrupt disk input, unchecked offsets, and integer-overflow risks as correctness issues.
+- When uncertain about a database invariant, stop and explain the ambiguity instead of guessing.
+- After implementation, run formatting, tests, `clippy`, and relevant property/fuzz tests; report exact results.
+
+### Recommended Task Prompt Template
+
+```
+You are modifying an existing Rust database repository.
+
+Current roadmap phase: <phase number and name>
+```
