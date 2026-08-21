@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/pager",
+    "crates/btree",
 ]
 resolver = "2"
 
