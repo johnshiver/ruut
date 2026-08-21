@@ -13,17 +13,27 @@ use crate::types::CommitId;
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     /// The commit that produced this snapshot.
-    pub commit_id: CommitId,
+    pub(crate) commit_id: CommitId,
     /// The root node at the time of this snapshot. `None` means the tree was empty.
-    pub root: Option<Arc<Node>>,
+    pub(crate) root: Option<Arc<Node>>,
 }
 
 impl Snapshot {
     /// Create a snapshot representing an empty tree at commit 0.
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Snapshot {
             commit_id: 0,
             root: None,
         }
+    }
+
+    /// The commit that produced this snapshot.
+    pub fn commit_id(&self) -> CommitId {
+        self.commit_id
+    }
+
+    /// The root node captured by this snapshot, if any.
+    pub fn root(&self) -> Option<&Arc<Node>> {
+        self.root.as_ref()
     }
 }

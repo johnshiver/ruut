@@ -68,7 +68,7 @@ impl BTree {
 
     /// Return the current commit id.
     pub fn commit_id(&self) -> CommitId {
-        self.snapshot.commit_id
+        self.snapshot.commit_id()
     }
 
     // -------------------------------------------------------------------------
@@ -82,7 +82,7 @@ impl BTree {
 
     /// Look up `key` in an arbitrary snapshot.
     pub fn get_in_snapshot(snap: &Snapshot, key: &[u8]) -> Option<Value> {
-        Self::get_in(snap.root.as_deref()?, key)
+        Self::get_in(snap.root().map(Arc::as_ref)?, key)
     }
 
     fn get_in(node: &Node, key: &[u8]) -> Option<Value> {
@@ -195,9 +195,10 @@ impl BTree {
             }
             DeleteResult::Removed(new_root) => {
                 let collapsed = Self::collapse_root(new_root);
-                // If the tree is now empty (collapsed is an empty leaf), store None.
+                // If the tree is now empty, store None.
                 let final_root = match collapsed.as_ref() {
                     Node::Leaf(l) if l.keys.is_empty() => None,
+                    Node::Internal(i) if i.children.is_empty() => None,
                     _ => {
                         let threaded = Self::thread_leaves(collapsed);
                         Some(threaded)
@@ -232,7 +233,7 @@ impl BTree {
                     DeleteResult::Removed(new_child) => {
                         let child_is_empty = match new_child.as_ref() {
                             Node::Leaf(l) => l.keys.is_empty(),
-                            Node::Internal(_) => false,
+                            Node::Internal(i) => i.children.is_empty(),
                         };
                         if child_is_empty {
                             // Remove the separator key that pointed to this child.

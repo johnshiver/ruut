@@ -156,7 +156,11 @@ fn validate_next_links(root: &Arc<Node>) -> Result<(), ValidationError> {
                     None => break,
                 }
             }
-            Node::Internal(_) => break, // unexpected
+            Node::Internal(_) => {
+                return Err(ValidationError::NextLinkOrderViolation {
+                    description: "leaf next pointer referenced an internal node".to_string(),
+                });
+            }
         }
     }
     Ok(())
