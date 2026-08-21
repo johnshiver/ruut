@@ -1,18 +1,21 @@
 # ruut
 
-> A single-node, embedded relational database written in Rust, built on a pure **Copy-on-Write (CoW) B+Tree** backed by a memory-mapped file.
+> A single-node, embedded relational database written in Rust, built on a **Copy-on-Write (CoW) B+ Tree** with page-oriented storage.
 
 ## Overview
 
-`ruut` diverges from traditional MVCC designs (e.g., PostgreSQL) that overwrite pages in-place and rely on Write-Ahead Logs. Instead it uses an append-only storage model that naturally provides:
+`ruut` is a storage engine whose fundamental model is an append-only, copy-on-write B+ tree. Every committed database state is represented by an immutable root page and a monotonically increasing commit identifier. Transactions read from a stable snapshot and publish a new root using optimistic concurrency control (OCC).
 
-- **Zero-cost branching** — historical tree roots are retained for free.
-- **Lock-free readers** — snapshot isolation via immutable root pointers.
-- **Native time-travel queries** — `SELECT ... AS OF VERSION <txid>`.
-- **First-class Optimistic Concurrency Control (OCC)** — version numbers embedded in every tuple.
-- **ACID guarantees** — without a WAL; durability is achieved through a two-phase Meta Page commit + `fsync`.
+Key properties:
 
-The full architectural specification lives in [`docs/design.md`](docs/design.md).
+- **Immutable committed pages** — once written, a page is never modified.
+- **Stable snapshots** — identified by `CommitId` + root `PageId`; historical reads are a first-class feature.
+- **Crash consistency** — dual superblocks guarantee the engine always recovers to a complete, valid commit.
+- **Table-level history retention** — selected tables can retain all historical state for audit and time-travel queries.
+- **Explicit on-disk format** — versioned binary codec, not `serde`/`bincode`.
+- **Property testing and fuzzing as first-class correctness tools**.
+
+The full technical design lives in [`docs/design.md`](docs/design.md).
 
 ## Repository Layout
 
@@ -20,65 +23,93 @@ The full architectural specification lives in [`docs/design.md`](docs/design.md)
 ruut/
 ├── src/                  # Thin binary entry-point
 ├── crates/
-│   └── pager/            # Phase 1 — storage layer (page I/O, Meta Page, Free List)
+│   └── pager/            # Existing storage scaffolding (being superseded)
 ├── docs/
-│   └── design.md         # Full design document
+│   └── design.md         # Full technical design and invariants
 └── Cargo.toml            # Workspace manifest
 ```
 
 ## Implementation Roadmap
 
-The project is broken into five phases that map directly to the design document.
+The project is broken into eleven phases. Each phase has a concrete exit criterion; no phase begins until the previous phase's exit criterion is met.
 
-### Phase 1 — Pager & I/O (`crates/pager`) 🚀 *Completed*
+### Phase 0 — Repository Baseline ✅ *Current*
 
-> Storage layer: memory-mapped files, page allocation, and Meta Page management.
+- Document invariants and architecture.
+- CI: `cargo fmt`, `clippy`, unit tests, property-test framework.
 
-- [x] `memmap2` integration for mmap-backed page access
-- [x] Fixed 4 KB page allocation and deallocation
-- [x] Meta Page (Page 0) read/write: magic number, schema version, TxID, root page ID
-- [x] Free List scaffolding
+### Phase 1 — Logical In-Memory CoW B+ Tree
 
-**Key constants:** `PAGE_SIZE = 4096`, `MAGIC = 0xCAFEBABE`
+Prove B+ tree algorithms using plain Rust types (`Box`/`Arc`). No page encoding yet.
 
-### Phase 2 — CoW B+Tree (`crates/btree`) 🎯 *Next Task*
+- [ ] `get`, `put`/`upsert`, `delete`, range scan
+- [ ] Splits, root growth
+- [ ] Snapshot preservation (mutations never alter old roots)
+- [ ] Model-based property tests against `std::collections::BTreeMap`
+- [ ] Structural validator
 
-> Index layer: Copy-on-Write path-copying for Insert, Update, Delete.
+### Phase 2 — Fixed-Size Page Model
 
-- [ ] Branch and leaf node structures with cell-pointer layout
-- [ ] CoW insert / update / delete (never overwrite; always allocate new pages)
-- [ ] Node splitting and merging
-- [ ] Binary search over sorted cell pointers
+Introduce the page abstraction and explicit binary codec.
 
-### Phase 3 — Transaction Manager (`crates/txn`)
+- [ ] `PageId`, `DirtyPageId`, `PageRef`, `PageBuf` types
+- [ ] Page headers and explicit little-endian codec
+- [ ] `MemoryPageStore`
+- [ ] B+ tree internals converted from Rust references to page references
+- [ ] Fuzz page decoding
 
-> Orchestrates atomic root swaps, snapshot isolation, and OCC validation.
+### Phase 3 — File Persistence
 
-- [ ] Read transactions — immutable snapshots via `arc-swap`
-- [ ] Write transactions — exclusive lock + CoW commit
-- [ ] Two-phase commit: flush pages → `fsync` → Meta Page swap → `fsync`
-- [ ] OCC validation: ReadSet / WriteSet tracking and conflict detection
-- [ ] Background reclamation thread for the Free List
+- [ ] `FilePageStore` with positioned I/O (`pread`/`pwrite`)
+- [ ] Append-only page allocation
+- [ ] Create/open database format
+- [ ] Close/reopen integration tests
 
-### Phase 4 — Relational Tuple Serializer (`crates/tuple`)
+### Phase 4 — Atomic Commits and Recovery
 
-> Maps relational rows (with implicit system fields) into flat byte arrays.
+- [ ] Dual superblocks with generation counters and checksums
+- [ ] Dirty-page finalization and root publication protocol
+- [ ] Recovery: choose newest valid superblock on open
+- [ ] Failpoints and crash/reopen tests
 
-- [ ] Tuple header: `TxID (8B)`, `SchemaVersion (4B)`, `Reserved (4B)`
-- [ ] Column encoding: fixed-size types, variable-length strings/blobs, NULL marker
-- [ ] Schema versioning and forward-compatible decoding
-- [ ] Primary key extraction and secondary index support
-- [ ] `_sys_version` and `_sys_txid` implicit columns
+### Phase 5 — Transactions and Coarse OCC
 
-### Phase 5 — SQL / API Layer (`crates/sql`)
+- [ ] `Snapshot` and `Transaction` APIs
+- [ ] Private dirty pages invisible before commit
+- [ ] Commit rejected when generation differs from base
+- [ ] Retryable `Conflict` error and concurrency tests
 
-> Query parser, executor, time-travel queries, and optional HTTP API.
+### Phase 6 — Durable Commit History
 
-- [ ] SQL parser (`sqlparser-rs`)
-- [ ] Query executor (table scan, primary-key lookup, secondary-index scan)
-- [ ] Time-travel syntax: `SELECT ... AS OF VERSION <txid>`
-- [ ] Stateless OCC syntax: `UPDATE ... EXPECTING VERSION <v>`
-- [ ] HTTP/REST API (optional)
+- [ ] `CommitRecord` and durable commit-log storage
+- [ ] `snapshot(commit_id)` and `snapshot_at(timestamp)`
+- [ ] Retention and pinning semantics
+
+### Phase 7 — Relational Catalog and Tables
+
+- [ ] Stable row/key encoding
+- [ ] Transactional catalog (table IDs, schemas, history policy)
+- [ ] Table primary indexes, schema metadata, basic scalar types
+- [ ] Secondary indexes
+
+### Phase 8 — Audited Tables
+
+- [ ] `HistoryPolicy` (`None` / `RetainAll`) on table metadata
+- [ ] AS-OF reads through historical snapshots
+- [ ] Entity-history API
+
+### Phase 9 — Minimal SQL
+
+- [ ] `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
+- [ ] Transaction statements (`BEGIN` / `COMMIT` / `ROLLBACK`)
+- [ ] `AS OF VERSION` / `AS OF SYSTEM TIME` syntax
+
+### Phase 10 — GC, Performance, and mmap
+
+- [ ] Reachability-based page reclamation
+- [ ] Offline/stop-the-world compaction
+- [ ] Benchmark page sizes and I/O paths
+- [ ] Prototype read-only mmap *only after* `FilePageStore` is benchmarked
 
 ---
 
@@ -86,30 +117,30 @@ The project is broken into five phases that map directly to the design document.
 
 ```bash
 # Build the workspace
-cargo build
-
-# Run the placeholder binary
-cargo run
+cargo build --workspace
 
 # Run tests
-cargo test
+cargo test --workspace
+
+# Check formatting and lints
+cargo fmt --check
+cargo clippy --workspace
 ```
 
 ## Design Principles
 
 | Principle | Approach |
 |-----------|----------|
-| **Append-only storage** | New pages are always written at the end of the file; the Meta Page is the only page overwritten in-place. |
-| **Lock-free reads** | Readers hold an immutable reference to a root `PageId`; writers never touch pages a reader can see. |
-| **Optimistic writes** | Writers validate their ReadSet at commit time and retry on conflict; no reader ever blocks a writer. |
-| **Crash safety** | A crash before the second `fsync` leaves the old Meta Page intact; new pages are orphaned and reclaimed by GC. |
+| **Staged implementation** | No SQL, mmap, or fine-grained OCC until lower layers are proven correct. |
+| **Immutable committed pages** | Every committed page is write-once; new writes allocate new pages. |
+| **Explicit binary format** | Disk layout is hand-coded with little-endian routines and format versions. |
+| **Dual-superblock crash safety** | A crash mid-commit always leaves the previous valid superblock intact. |
+| **Correctness before optimization** | Property tests and fuzzing gate each phase; mmap is a late-phase optimization. |
 
 ## References
 
-- [LMDB](https://www.symas.com/lmdb) — embedded CoW B+Tree key-value store.
-- [SQLite B+Tree](https://www.sqlite.org/fileformat.html) — page-based storage with cell-pointer layout.
-- [arc-swap](https://docs.rs/arc-swap) — atomic `Arc` swaps for lock-free root pointer updates.
-- [memmap2](https://docs.rs/memmap2) — safe Rust bindings for memory-mapped I/O.
+- [LMDB](https://www.symas.com/lmdb) — embedded CoW B+ tree key-value store.
+- [SQLite file format](https://www.sqlite.org/fileformat.html) — page-based storage with slotted pages.
 
 ## License
 
