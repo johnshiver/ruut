@@ -124,28 +124,26 @@ impl BTree {
 
     fn insert_node(node: Arc<Node>, key: Key, value: Value) -> InsertResult {
         match Arc::unwrap_or_clone(node) {
-            Node::Leaf(mut leaf) => {
-                match leaf.keys.binary_search_by(|k| k.as_slice().cmp(&key)) {
-                    Ok(i) => {
-                        leaf.values[i] = value;
+            Node::Leaf(mut leaf) => match leaf.keys.binary_search_by(|k| k.as_slice().cmp(&key)) {
+                Ok(i) => {
+                    leaf.values[i] = value;
+                    InsertResult::Fit(Arc::new(Node::Leaf(leaf)))
+                }
+                Err(i) => {
+                    leaf.keys.insert(i, key);
+                    leaf.values.insert(i, value);
+                    if leaf.is_full() {
+                        let (left, sep, right) = Self::split_leaf(leaf);
+                        InsertResult::Split(
+                            Arc::new(Node::Leaf(left)),
+                            sep,
+                            Arc::new(Node::Leaf(right)),
+                        )
+                    } else {
                         InsertResult::Fit(Arc::new(Node::Leaf(leaf)))
                     }
-                    Err(i) => {
-                        leaf.keys.insert(i, key);
-                        leaf.values.insert(i, value);
-                        if leaf.is_full() {
-                            let (left, sep, right) = Self::split_leaf(leaf);
-                            InsertResult::Split(
-                                Arc::new(Node::Leaf(left)),
-                                sep,
-                                Arc::new(Node::Leaf(right)),
-                            )
-                        } else {
-                            InsertResult::Fit(Arc::new(Node::Leaf(leaf)))
-                        }
-                    }
                 }
-            }
+            },
             Node::Internal(mut internal) => {
                 let child_idx = Self::find_child(&internal, &key);
                 let child = internal.children.remove(child_idx);
@@ -212,16 +210,14 @@ impl BTree {
 
     fn remove_node(node: Arc<Node>, key: &[u8]) -> DeleteResult {
         match Arc::unwrap_or_clone(node) {
-            Node::Leaf(mut leaf) => {
-                match leaf.keys.binary_search_by(|k| k.as_slice().cmp(key)) {
-                    Ok(i) => {
-                        leaf.keys.remove(i);
-                        leaf.values.remove(i);
-                        DeleteResult::Removed(Arc::new(Node::Leaf(leaf)))
-                    }
-                    Err(_) => DeleteResult::NotFound,
+            Node::Leaf(mut leaf) => match leaf.keys.binary_search_by(|k| k.as_slice().cmp(key)) {
+                Ok(i) => {
+                    leaf.keys.remove(i);
+                    leaf.values.remove(i);
+                    DeleteResult::Removed(Arc::new(Node::Leaf(leaf)))
                 }
-            }
+                Err(_) => DeleteResult::NotFound,
+            },
             Node::Internal(mut internal) => {
                 let child_idx = Self::find_child(&internal, key);
                 let child = internal.children.remove(child_idx);
@@ -301,11 +297,7 @@ impl BTree {
         }
     }
 
-    fn range_in(
-        root: &Arc<Node>,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Vec<(Key, Value)> {
+    fn range_in(root: &Arc<Node>, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<(Key, Value)> {
         let first_leaf = Self::find_first_leaf(root, start);
         let mut result = Vec::new();
         let mut current: Option<Arc<Node>> = Some(first_leaf);

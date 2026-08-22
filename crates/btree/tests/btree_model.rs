@@ -296,7 +296,11 @@ fn test_delete_nonexistent_returns_false() {
     let before = tree.commit_id();
     let found = tree.delete_key(&key(99));
     assert!(!found);
-    assert_eq!(tree.commit_id(), before, "commit id must not advance on NotFound");
+    assert_eq!(
+        tree.commit_id(),
+        before,
+        "commit id must not advance on NotFound"
+    );
 }
 
 #[test]

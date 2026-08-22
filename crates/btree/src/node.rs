@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::types::{Key, Value, ORDER};
+use crate::types::{Key, ORDER, Value};
 
 /// A B+ tree node, either a leaf or an internal node.
 #[derive(Clone, Debug)]
