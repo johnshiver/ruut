@@ -67,7 +67,6 @@ class BPlusTree:
         node = self.root
 
         while node is not None:
-
             # We reached the actual data.
             if isinstance(node, Leaf):
                 for i, existing_key in enumerate(node.keys):
@@ -170,7 +169,6 @@ class BPlusTree:
         # -------------------------------------------------------------------
 
         if isinstance(node, Leaf):
-
             # Find sorted insertion position.
             i = 0
 
