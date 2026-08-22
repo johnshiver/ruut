@@ -102,7 +102,24 @@ impl BTree {
     // insert / upsert
     // -------------------------------------------------------------------------
 
-    /// Insert or update `key` → `value`. Advances the commit id.
+    /// Insert `key` with `value`, or replace the value for an existing key.
+    ///
+    /// This is a copy-on-write mutation: the current root is consumed and the
+    /// path to the affected leaf is rebuilt by [`Self::insert_node`]. Nodes
+    /// that are still shared with an older [`Snapshot`] are cloned by
+    /// `Arc::unwrap_or_clone`, so previously obtained snapshots remain
+    /// immutable. Uniquely owned nodes may be reused without cloning.
+    ///
+    /// If insertion overflows the root, a new internal root is created from the
+    /// two split children and the promoted separator key. After the structural
+    /// update, leaf `next` pointers are rebuilt so range scans traverse the new
+    /// version of the tree rather than nodes retained by an older snapshot.
+    ///
+    /// Every call advances the commit id exactly once, including an upsert that
+    /// only replaces the value of an existing key.
+    ///
+    /// To retain the pre-insert view, call [`BTree::snapshot`] before invoking
+    /// this method.
     pub fn insert(&mut self, key: Key, value: Value) {
         let new_root = match self.snapshot.root.take() {
             None => {
@@ -122,6 +139,21 @@ impl BTree {
         self.advance(Some(threaded));
     }
 
+    /// Recursively apply an insert/upsert to one subtree and return its new
+    /// root.
+    ///
+    /// The function follows exactly one root-to-leaf path. `Arc::unwrap_or_clone`
+    /// gives ownership of a uniquely referenced node or clones a shared node,
+    /// which is the mechanism that preserves older snapshots during mutation.
+    ///
+    /// For a leaf, an existing key has its value replaced; a new key/value pair
+    /// is inserted in sorted order. An overflowing leaf is split and the first
+    /// key of the right leaf is returned as the separator.
+    ///
+    /// For an internal node, the recursively rebuilt child replaces the old
+    /// child. A child split inserts its promoted separator and right sibling
+    /// into this node; if that overflows the internal node, the split is
+    /// propagated upward through [`InsertResult::Split`].
     fn insert_node(node: Arc<Node>, key: Key, value: Value) -> InsertResult {
         match Arc::unwrap_or_clone(node) {
             Node::Leaf(mut leaf) => match leaf.keys.binary_search_by(|k| k.as_slice().cmp(&key)) {
@@ -176,8 +208,28 @@ impl BTree {
     // delete
     // -------------------------------------------------------------------------
 
-    /// Remove `key` from the tree. Returns `true` if the key was present.
-    /// Advances the commit id only when the key was found.
+    /// Remove `key` from the current tree.
+    ///
+    /// Returns `true` when the key existed and was removed. A successful delete
+    /// advances the commit id exactly once. If the key is absent, the original
+    /// root is restored and the commit id is left unchanged.
+    ///
+    /// Deletion is copy-on-write for the same reason as insertion:
+    /// [`Self::remove_node`] rebuilds the affected root-to-leaf path while
+    /// `Arc::unwrap_or_clone` clones any node that is still shared with an older
+    /// [`Snapshot`]. Previously obtained snapshots therefore continue to expose
+    /// the pre-delete tree.
+    ///
+    /// Phase 1 deliberately does **not** rebalance underfull nodes. Empty
+    /// children are pruned, affected separator keys are repaired, and a root
+    /// internal node with one remaining child is collapsed. If the final root
+    /// is an empty leaf or an internal node with no children, the tree becomes
+    /// empty (`root = None`).
+    ///
+    /// Leaf `next` pointers are rebuilt after a successful non-empty deletion.
+    ///
+    /// To retain the pre-delete view, call [`BTree::snapshot`] before invoking
+    /// this method.
     pub fn delete_key(&mut self, key: &[u8]) -> bool {
         let root = match self.snapshot.root.take() {
             None => {
@@ -208,6 +260,21 @@ impl BTree {
         }
     }
 
+    /// Recursively remove `key` from one subtree and return the rebuilt
+    /// subtree root.
+    ///
+    /// `NotFound` means no structural change occurred below this node. The
+    /// caller can therefore put the original child back and ultimately restore
+    /// the original tree root without advancing the commit id.
+    ///
+    /// `Removed` means the key was deleted and carries the new subtree root.
+    /// Empty children are pruned rather than merged or redistributed. When a
+    /// non-leftmost child remains non-empty, its parent separator is refreshed
+    /// from `new_child.first_key()` because separators represent the first key
+    /// of `children[i + 1]`.
+    ///
+    /// As with insertion, `Arc::unwrap_or_clone` mutates only an owned copy of
+    /// any node that is shared with an older snapshot.
     fn remove_node(node: Arc<Node>, key: &[u8]) -> DeleteResult {
         match Arc::unwrap_or_clone(node) {
             Node::Leaf(mut leaf) => match leaf.keys.binary_search_by(|k| k.as_slice().cmp(key)) {
@@ -262,7 +329,14 @@ impl BTree {
         }
     }
 
-    /// Collapse a root internal node with a single child.
+    /// Collapse one redundant level at the root after deletion.
+    ///
+    /// Only the root may be collapsed this way: if it is an internal node with
+    /// exactly one child, that child becomes the new root. This keeps lookups
+    /// from carrying an unnecessary top-level internal node after pruning.
+    ///
+    /// Phase 1 does not recursively rebalance or merge underfull non-root
+    /// internal nodes.
     fn collapse_root(node: Arc<Node>) -> Arc<Node> {
         match node.as_ref() {
             Node::Internal(internal) if internal.children.len() == 1 => {
@@ -376,6 +450,12 @@ impl BTree {
         }
     }
 
+    /// Publish a successfully mutated root as the tree's new current snapshot.
+    ///
+    /// This is the mutation commit point for the in-memory tree: it increments
+    /// the current commit id exactly once and installs `root`. Callers invoke it
+    /// only after a mutation has produced its final tree structure (including
+    /// leaf re-threading when required).
     fn advance(&mut self, root: Option<Arc<Node>>) {
         self.snapshot = Snapshot {
             commit_id: self.snapshot.commit_id + 1,
@@ -387,8 +467,18 @@ impl BTree {
     // Leaf next-pointer threading
     // -------------------------------------------------------------------------
 
-    /// Rebuild all leaf `next` pointers in-order. Called after each mutation.
-    /// O(n) but simple and correct for Phase 1.
+    /// Rebuild all leaf `next` pointers for the newly mutated tree.
+    ///
+    /// A leaf's `next` pointer is itself an `Arc<Node>`. Reusing stale links
+    /// after copy-on-write updates could make a range scan leave the new tree
+    /// version and continue through leaves belonging to an older snapshot.
+    /// Re-threading ensures every leaf in the new root points to the next leaf
+    /// from that same version.
+    ///
+    /// Phase 1 implements this conservatively in O(n): collect leaf payloads in
+    /// key order, rebuild the leaf chain from right to left, then rebuild the
+    /// internal tree with those new leaf `Arc`s. This favors correctness and
+    /// simple snapshot semantics over mutation-time efficiency.
     fn thread_leaves(root: Arc<Node>) -> Arc<Node> {
         // Collect all leaf data in order.
         let mut leaf_data: Vec<Leaf> = Vec::new();
